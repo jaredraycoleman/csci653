@@ -1,0 +1,3 @@
+[submodule "pegasus-instances"]
+	path = pegasus-instances
+	url = https://github.com/wfcommons/pegasus-instances.git
