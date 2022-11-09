@@ -2,7 +2,7 @@ import json
 import pathlib
 from functools import lru_cache
 from hashlib import sha256
-from typing import Dict, Generator, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 import networkx as nx
@@ -227,7 +227,7 @@ class Node:
     def __repr__(self) -> str:
         return f"Node {self.node_id} (color_hash={self.color_hash[:8]})"
 
-    def process_signals(self, signals: List[Signal]) -> Dict[str, List[Signal]]:
+    def process_signals(self, signals: List[Signal]) -> Tuple[Dict[str, List[Signal]],Dict[str, List[Signal]]]:
         """Process signals at this node.
 
         Args:
@@ -251,14 +251,16 @@ class Node:
         }
         
         # process signals by signal class
+        patterns = {}
         output_signals: List[Signal] = []
         for signal_class, signals in signals_by_class.items():
             if len(signals) > 1:
-                print(f"Pattern Detected for {signal_class}/{self.node_id}")
-                for instance, signal in enumerate(signals, start=1):
-                    print(f"  Instance {instance}")
-                    for node in signal.node_history:
-                        print(f"    {node.node_id}")
+                patterns[signal_class] = signals
+                # print(f"Pattern Detected for {signal_class}/{self.node_id}")
+                # for instance, signal in enumerate(signals, start=1):
+                #     print(f"  Instance {instance}")
+                #     for node in signal.node_history:
+                #         print(f"    {node.node_id}")
 
             new_signal = Signal.combine_signals(signals)
             new_signal.add_node(self)
@@ -274,7 +276,7 @@ class Node:
         child_signals = {}
         for child_color_hash, children in children_by_color_hash.items():
             if len(children) > 1:
-                signal_class = f"{self.node_id}/{child_color_hash[:8]}"
+                signal_class = uuid.uuid4().hex # f"{self.node_id}/{child_color_hash[:8]}"
                 for i, child in enumerate(children):
                     new_signal = Signal(
                         signal_class=signal_class,
@@ -285,7 +287,7 @@ class Node:
             else:
                 child_signals[children[0]] = output_signals
         
-        return child_signals
+        return child_signals, patterns
 
 
 def dag_to_nodes(graph: nx.DiGraph) -> List[Node]:
@@ -322,16 +324,63 @@ def dag_to_nodes(graph: nx.DiGraph) -> List[Node]:
     
     return [nodes[node_id] for node_id in top_sort]
 
+def test_graph() -> nx.DiGraph:
+    graph = nx.DiGraph()
+    graph.add_node('A', color='A')
+    graph.add_node('B1', color='B')
+    graph.add_node('B2', color='B')
+    graph.add_node('C1', color='C')
+    graph.add_node('C2', color='C')
+    graph.add_node('D1', color='D')
+    graph.add_node('D2', color='D')
+    graph.add_node('E', color='E')
+    graph.add_node('F', color='F')
+
+    graph.add_edge('A', 'B1')
+    graph.add_edge('A', 'B2')
+    graph.add_edge('B1', 'C1')
+    graph.add_edge('B1', 'D1')
+    graph.add_edge('B2', 'C2')
+    graph.add_edge('B2', 'D2')
+    graph.add_edge('C1', 'E')
+    graph.add_edge('C2', 'E')
+    graph.add_edge('D1', 'F')
+    graph.add_edge('D2', 'F')
+
+    return graph
+
 thisdir = pathlib.Path(__file__).parent.resolve()
 def main():
-    graph = load_dag_from_json(thisdir.joinpath('pegasus-instances', 'montage', 'chameleon-cloud', 'montage-chameleon-2mass-01d-001.json'))
+    # graph = load_dag_from_json(thisdir.joinpath('pegasus-instances', 'montage', 'chameleon-cloud', 'montage-chameleon-2mass-01d-001.json'))
+    graph = test_graph()
     graph = set_color_hashes(graph)
     
+    partial_patterns: Dict[str, List[Signal]] = {}
     signals: Dict[str, List[Signal]] = {}
     for node in dag_to_nodes(graph):
-        new_signals = node.process_signals(signals.get(node, []))
+        new_signals, new_patterns = node.process_signals(signals.get(node, []))
         for child, child_signals in new_signals.items():
             signals.setdefault(child, []).extend(child_signals)
+        for signal_class, pattern_signals in new_patterns.items():
+            partial_patterns.setdefault(signal_class, []).extend(pattern_signals)
+
+    # Merge partial patterns with overlapping node_history
+    patterns: Dict[str, List[Signal]] = {}
+    for signal_class, partial_pattern_signals in partial_patterns.items():
+        all_node_ids = set().union(node.node_id for signal in partial_pattern_signals for node in signal.node_history)
+        pattern_instances = list(nx.weakly_connected_components(graph.subgraph(all_node_ids)))
+        pattern_hash = sha256(str(sorted(set(pattern_instances[0]))).encode()).hexdigest()
+        patterns.setdefault(pattern_hash, []).extend(pattern_instances)
+
+    # print patterns
+    for pattern_hash, pattern_instances in patterns.items():
+        print(f"Pattern {pattern_hash}")
+        for instance, instance_nodes in enumerate(pattern_instances, start=1):
+            print(f"  Instance {instance}")
+            for node in instance_nodes:
+                print(f"    {node}")
+
+    print(f"found {len(patterns)} patterns")
 
     fig, ax = draw_workflow(graph, color_attr="color")
     plt.legend()
