@@ -3,6 +3,7 @@ import pathlib
 from functools import lru_cache
 from hashlib import sha256
 from typing import Dict, Generator, List, Optional, Set, Tuple, Union
+import uuid
 
 import networkx as nx
 import numpy as np
@@ -34,7 +35,7 @@ def bottom_up_color_hash(color: str, child_bottom_up_color_hashes: Set[str]) -> 
     """
     return sha256((color + "".join(sorted(child_bottom_up_color_hashes))).encode()).hexdigest()
 
-def color_hash(top_down_color_hash: str, bottom_up_color_hash: str) -> str:
+def full_color_hash(top_down_color_hash: str, bottom_up_color_hash: str) -> str:
     """Compute the color hash of a node.
 
     Args:
@@ -61,7 +62,7 @@ def set_color_hashes(graph: nx.DiGraph) -> nx.DiGraph:
         graph.nodes[node]["bottom_up_color_hash"] = bottom_up_color_hash(graph.nodes[node]["color"], {graph.nodes[child]["bottom_up_color_hash"] for child in graph.successors(node)})
     for node in top_sort:
         graph.nodes[node]["top_down_color_hash"] = top_down_color_hash(graph.nodes[node]["color"], {graph.nodes[child]["top_down_color_hash"] for child in graph.predecessors(node)})
-        graph.nodes[node]["color_hash"] = color_hash(graph.nodes[node]["top_down_color_hash"], graph.nodes[node]["bottom_up_color_hash"])
+        graph.nodes[node]["color_hash"] = full_color_hash(graph.nodes[node]["top_down_color_hash"], graph.nodes[node]["bottom_up_color_hash"])
     return graph
 
 def rec_set_color_hashes(graph: nx.DiGraph) -> nx.DiGraph:
@@ -107,7 +108,7 @@ def rec_set_color_hashes(graph: nx.DiGraph) -> nx.DiGraph:
         Returns:
             str: The color hash of the node
         """
-        return color_hash(node_td_hash(node), node_bu_hash(node))
+        return full_color_hash(node_td_hash(node), node_bu_hash(node))
 
     for node in graph.nodes:
         graph.nodes[node]["top_down_color_hash"] = node_td_hash(node)
@@ -126,6 +127,10 @@ def load_dag_from_json(path: Union[pathlib.Path, str]) -> nx.DiGraph:
     for task in data['workflow']['tasks']:
         for parent in task['parents']:
             graph.add_edge(parent, task['name'])
+
+    # Remove forward edges
+    _graph = nx.transitive_reduction(graph)
+    graph = nx.edge_subgraph(graph, _graph.edges)
     
     return graph
 
@@ -174,81 +179,165 @@ def get_root_idx(paths: List[List[str]]) -> int:
     arr = np.array([path[:min_len] for path in paths])
     return np.argmax(np.all(arr == arr[0, :], axis=0))
 
-def get_patterns(paths: List[List[str]]) -> Generator[List[str], None, None]:
-    """Get the patterns from the paths.
+class Signal:
+    def __init__(self, signal_class: str, ids: List[int], total_ids: int, node_history: Set["Node"] = set()) -> None:
+        self.signal_class = signal_class
+        self.ids = ids
+        self.total_ids = total_ids
+        self.node_history = node_history
+
+    def add_node(self, node: "Node") -> None:
+        self.node_history.add(node)
+
+    def __repr__(self) -> str:
+        return f"Signal {self.signal_class[:8]} (ids={self.ids} - {len(self.ids)}/{self.total_ids})" #\nNodes: {list(self.node_history)}"
+    
+    @classmethod
+    def combine_signals(self, signals: List["Signal"]) -> "Signal":
+        # all color hashes should be the same
+        assert len(set(signal.signal_class for signal in signals)) == 1
+        signal_class = signals[0].signal_class
+
+        # total ids should be the same
+        assert len(set(signal.total_ids for signal in signals)) == 1
+        total_ids = signals[0].total_ids
+
+        # combine ids
+        ids = {id for signal in signals for id in signal.ids}
+        
+        # combine node history
+        node_history = {node for signal in signals for node in signal.node_history}
+
+        return Signal(
+            signal_class=signal_class,
+            ids=ids,
+            total_ids=total_ids,
+            node_history=node_history
+        )
+
+class Node:
+    def __init__(self, node_id: str, color_hash: str, children: List["Node"]) -> None:
+        self.node_id = node_id
+        self.color_hash = color_hash
+        self.children = children
+
+    def __hash__(self) -> int:
+        return hash(self.node_id)
+
+    def __repr__(self) -> str:
+        return f"Node {self.node_id} (color_hash={self.color_hash[:8]})"
+
+    def process_signals(self, signals: List[Signal]) -> Dict[str, List[Signal]]:
+        """Process signals at this node.
+
+        Args:
+            signals (List[Signal]): The signals to process
+
+        Returns:
+            Dict[str, List[Signal]]: output signals. The key is child node id the value is the list of signals.
+        """
+        # group signals by signal class, then ids
+        signals_by_class_and_id: Dict[str, Dict[Tuple[int], List[Signal]]] = {}
+        for signal in signals:
+            signals_by_class_and_id.setdefault(signal.signal_class, {}).setdefault(tuple(sorted(signal.ids)), []).append(signal)
+
+        # Merge signals with the same ids
+        signals_by_class = {
+            signal_class: [
+                Signal.combine_signals(id_signals)
+                for id_signals in signals_by_id.values()
+            ]
+            for signal_class, signals_by_id in signals_by_class_and_id.items()
+        }
+        
+        # process signals by signal class
+        output_signals: List[Signal] = []
+        for signal_class, signals in signals_by_class.items():
+            if len(signals) > 1:
+                print(f"Pattern Detected for {signal_class}/{self.node_id}")
+                for instance, signal in enumerate(signals, start=1):
+                    print(f"  Instance {instance}")
+                    for node in signal.node_history:
+                        print(f"    {node.node_id}")
+
+            new_signal = Signal.combine_signals(signals)
+            new_signal.add_node(self)
+            if len(new_signal.ids) < new_signal.total_ids:
+                output_signals.append(new_signal)
+
+        # group children by color hash
+        children_by_color_hash: Dict[str, List[Node]] = {}
+        for child in self.children:
+            children_by_color_hash.setdefault(child.color_hash, []).append(child)
+        
+        # send signals to children
+        child_signals = {}
+        for child_color_hash, children in children_by_color_hash.items():
+            if len(children) > 1:
+                signal_class = f"{self.node_id}/{child_color_hash[:8]}"
+                for i, child in enumerate(children):
+                    new_signal = Signal(
+                        signal_class=signal_class,
+                        ids=[i],
+                        total_ids=len(children)
+                    )
+                    child_signals[child] = [*output_signals, new_signal]
+            else:
+                child_signals[children[0]] = output_signals
+        
+        return child_signals
+
+
+def dag_to_nodes(graph: nx.DiGraph) -> List[Node]:
+    """Convert a DAG to a list of nodes.
 
     Args:
-        paths (List[List[str]]): The paths
+        graph (nx.DiGraph): The DAG
 
-    Yields:
-        List[str]: The patterns
-    """
-    root_idx = get_root_idx(paths)
-    for i in range(len(paths)):
-        yield paths[i][root_idx:]
-        paths[i] = paths[i][root_idx+1:] # trim path
-
-    # group paths by commmon first element
-    path_groups: Dict[str, List[str]] = {}
-    for path in paths:
-        if len(path) > 0:
-            path_groups.setdefault(path[0], []).append(path)
-    
-    # recurse on each group
-    for group in path_groups.values():
-        if len(group) > 1:
-            yield from get_patterns(group)
-    
-def task_func(task: str, color_hash: str, in_messages: List[Tuple[str, List[str]]]) -> Tuple[List[str], Tuple[str, List[str]]]:
-    """
-
-    Args:
-        in_messages (List[Tuple[str, List[str]]]): List of tuples of the form (color_hash, [critical_path])
-    
     Returns:
-        Tuple[str, List[str]]: Tuple of the form (color_hash, [critical_path])
+        List[Node]: The nodes
     """
-    # group messages by color hash
-    color_hash_groups = {}
-    for color_hash, critical_path in in_messages:
-        if color_hash not in color_hash_groups:
-            color_hash_groups[color_hash] = []
-        color_hash_groups[color_hash].append(critical_path)
+    # traverse in reverse topological order
+    nodes: Dict[str, Node] = {}
+    graph = graph.copy()
+    # add src and sink nodes
+    graph.add_node('src', color_hash='src')
+    graph.add_node('sink', color_hash='sink')
 
-    patterns = []
-    for color_hash, critical_paths in color_hash_groups.items():
-        # get the patterns from the critical paths
-        if len(critical_paths) > 1:
-            patterns.extend(get_patterns(critical_paths))
-    
-    paths = [path for _, path in in_messages]
-    root_idx = get_root_idx(paths)
-    critical_path = [*paths[0][:root_idx+1], task]
-    return patterns, (color_hash, critical_path)
+    for node in graph.nodes:
+        if node != 'src' and node != 'sink' and graph.in_degree(node) == 0:
+            graph.add_edge('src', node)
+        if node != 'src' and node != 'sink' and graph.out_degree(node) == 0:
+            graph.add_edge(node, 'sink')
 
-def find_patterns(graph: nx.DiGraph):
-    # compute color hashes
-    set_color_hashes(graph)
     top_sort = list(nx.topological_sort(graph))
-    messages = {}
-    for node in top_sort:
-        patterns, msg = task_func(node, graph.nodes[node]["color_hash"], messages.get(node, [('SRC', ['SRC'])]))
-        for child in graph.successors(node):
-            if child not in messages:
-                messages[child] = []
-            messages[child].append(msg)
-        for pattern in patterns:
-            print(f"Pattern: {pattern}")
+    for node_id in top_sort[::-1]:
+        node = graph.nodes[node_id]
+        children = [nodes[child_id] for child_id in graph.successors(node_id)]
+        nodes[node_id] = Node(
+            node_id=node_id,
+            color_hash=node['color_hash'],
+            children=children
+        )
+    
+    return [nodes[node_id] for node_id in top_sort]
 
 thisdir = pathlib.Path(__file__).parent.resolve()
 def main():
     graph = load_dag_from_json(thisdir.joinpath('pegasus-instances', 'montage', 'chameleon-cloud', 'montage-chameleon-2mass-01d-001.json'))
     graph = set_color_hashes(graph)
-    find_patterns(graph)
+    
+    signals: Dict[str, List[Signal]] = {}
+    for node in dag_to_nodes(graph):
+        new_signals = node.process_signals(signals.get(node, []))
+        for child, child_signals in new_signals.items():
+            signals.setdefault(child, []).extend(child_signals)
 
-    fig, ax = draw_workflow(graph, color_attr="color_hash")
+    fig, ax = draw_workflow(graph, color_attr="color")
     plt.legend()
-    plt.show()
+    # save figure to disk
+    fig.savefig(thisdir.joinpath('workflow.png'))
+    plt.close(fig)
     
 
 if __name__ == "__main__":
